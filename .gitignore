@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+node_modules/
+.next/
+frontend/next-env.d.ts
+frontend/tsconfig.tsbuildinfo
