@@ -15,14 +15,15 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from app.core.events import Event, EventBus
+from app.core.events import EventBus
 from app.core.heuristics import parse_listing_text
 from app.core.llm import LLM, LLMError, image_block, pdf_block, text_block
 from app.ingestion import verification
 from app.ingestion.media import MediaItem, NormalisedMedia, normalise
 from app.prompts import LISTING_EXTRACTION_SYSTEM
-from app.schemas import Listing, ListingExtraction, PricePoint, VerificationResult
-from app.search.store import ListingStore
+from app.schemas import Event, Listing, ListingExtraction, PricePoint, VerificationResult
+from app.ingestion.storage import MediaStorage
+from app.search.store import ListingIndex
 
 log = logging.getLogger(__name__)
 
@@ -137,8 +138,9 @@ async def ingest(
     owner_id: str,
     owner_role: str,
     llm: LLM,
-    store: ListingStore,
+    store: ListingIndex,
     bus: EventBus,
+    storage: MediaStorage | None = None,
     keyframes: int = 6,
     auto_publish: bool = True,
 ) -> IngestionResult:
@@ -189,8 +191,13 @@ async def ingest(
     ver = await verification.verify(llm, documents, extraction) if documents else None
     lap("verify")
 
-    listing = Listing(owner_id=owner_id, owner_role=owner_role, data=extraction,
-                      media=[f.filename for f in files] + [d.filename for d in documents], verification=ver)
+    # Originals are kept (gallery, re-extraction with better models); legal docs go to private storage.
+    media_keys = [f.filename for f in files]
+    if storage:
+        media_keys = [await storage.put(f.data, f.filename, f.media_type) for f in files]
+        for d in documents:
+            await storage.put(d.data, d.filename, d.media_type, private=True)
+    listing = Listing(owner_id=owner_id, owner_role=owner_role, data=extraction, media=media_keys, verification=ver)
     listing.quality_score = quality_score(extraction, len(media.images), ver)
     if extraction.price_inr:
         listing.price_history.append(PricePoint(price_inr=extraction.price_inr))
@@ -199,7 +206,7 @@ async def ingest(
         listing.status = "live"
     else:
         listing.status = "draft" if blocking else "pending_review"
-    store.upsert(listing)
+    await store.upsert(listing)
     lap("index")
 
     if listing.status == "live":

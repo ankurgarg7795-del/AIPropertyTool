@@ -35,10 +35,12 @@ LLM_LISTING = {
 
 async def test_llm_ingestion_request_shape_and_reconciliation(fake_llm, container):
     llm, fake = fake_llm(LLM_LISTING)
+    owner = await container.db.create_user("+919811111111", ["owner"])
     r = await ingest(
         files=[MediaItem("living.png", "image/png", PNG_1PX, "image")], documents=[],
         transcript="teen BHK hai Whitefield mein, price 1.42 Cr negotiable", notes=None,
-        owner_id="o1", owner_role="owner", llm=llm, store=container.store, bus=container.bus)
+        owner_id=owner.id, owner_role="owner", llm=llm, store=container.store, bus=container.bus,
+        storage=container.storage)
 
     call = fake.calls[0]
     assert call["model"] == "claude-opus-5-5"
@@ -51,12 +53,16 @@ async def test_llm_ingestion_request_shape_and_reconciliation(fake_llm, containe
     assert r.listing.data.price_inr == 14_200_000  # unit slip corrected from transcript
     assert any("price conflict" in w for w in r.warnings)
     assert r.listing.status == "live"
-    assert container.bus.log[-1].type == "listing.published.v1"
+    assert (await container.db.recent_events(1))[0].type == "listing.published.v1"
+    stored = await container.store.get(r.listing.id)
+    assert stored.data.price_inr == 14_200_000 and stored.media[0].startswith("public/")
+    assert await container.storage.get(stored.media[0]) == PNG_1PX
 
 
 async def test_heuristic_ingestion_drafts_when_critical_fields_missing(container):
+    owner = await container.db.create_user("+919811111112", ["owner"])
     r = await ingest(files=[], documents=[], transcript=None, notes="3 bhk in Baner, east facing",
-                     owner_id="o1", owner_role="owner", llm=container.llm, store=container.store, bus=container.bus)
+                     owner_id=owner.id, owner_role="owner", llm=container.llm, store=container.store, bus=container.bus)
     assert r.listing.status == "draft"
     assert {"price_inr", "area"} <= set(r.listing.data.missing_fields)
     assert r.listing.data.clarifying_questions

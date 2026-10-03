@@ -63,3 +63,7 @@ input, textarea { font: inherit; width: 100%; padding: 10px 14px; border: 1px so
 .progress span { position: absolute; inset: 0; display: grid; place-items: center; }
 .questions { background: var(--warn-soft); padding: 10px 14px; border-radius: var(--radius); margin: 8px 0; }
 .warnings { color: var(--warn); }
+.nav div { align-items: center; }
+.login { max-width: 380px; margin: 48px auto; display: flex; flex-direction: column; gap: 12px; }
+.login form { display: flex; flex-direction: column; gap: 10px; }
+a.button { display: inline-block; padding: 8px 16px; border-radius: 999px; background: var(--accent); color: #fff; }

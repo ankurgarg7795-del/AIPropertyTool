@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { api, formatINR, getAnonUserId, type SearchFilters, type SearchResponse } from "@/lib/api";
+import { api, formatINR, type SearchFilters, type SearchResponse } from "@/lib/api";
 import ConciergeChat from "./ConciergeChat";
 
 type Turn = { id: number; query: string; result?: SearchResponse; error?: string; loading: boolean };
@@ -48,7 +48,7 @@ export default function ConversationalSearch() {
     const id = Date.now();
     setTurns((t) => [...t, { id, query, loading: true }]);
     try {
-      const result = await api.search(query, { userId: getAnonUserId(), filters, signal: ctrl.signal });
+      const result = await api.search(query, { filters, signal: ctrl.signal });
       setTurns((t) => t.map((x) => (x.id === id ? { ...x, result, loading: false } : x)));
     } catch (e) {
       if ((e as Error).name === "AbortError") return;

@@ -75,10 +75,6 @@ class SentenceTransformerEmbedder:
         return self._m.encode(texts, normalize_embeddings=True).tolist()
 
 
-def cosine(a: list[float], b: list[float]) -> float:
-    return sum(x * y for x, y in zip(a, b))  # vectors are L2-normalised
-
-
 _embedder: Embedder | None = None
 
 

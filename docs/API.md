@@ -8,7 +8,7 @@ FastAPI serves the live OpenAPI document at `/openapi.json` and Swagger UI at `/
 
 | Concern | Convention |
 |---|---|
-| Auth (prod) | `Authorization: Bearer <JWT>` (OTP login). Partner and developer bulk APIs use OAuth2 client credentials. The MVP accepts `user_id` / `owner_id` in the body. |
+| Auth | Phone OTP login (see **Authentication** below). Browsers use httpOnly `SameSite=Strict` cookies; native and API clients send `Authorization: Bearer <access token>`. The caller's identity always comes from the token, never from the request body. Partner and developer bulk APIs will use OAuth2 client credentials. |
 | Idempotency | `Idempotency-Key` header on every POST that creates a resource. The gateway stores the response in Redis for 24 h. |
 | Rate limits | Search: 60/min per user. Chat: 30/min per session. Upload: 10/h per user. Exceeding a limit returns `429` with a `Retry-After` header. |
 | Errors | `{"detail": "<message>"}`, or FastAPI's validation array for 422. Codes used: `404`, `413` (file too large), `422`, `429`, `502` (upstream AI failure when no fallback was possible). |
@@ -21,7 +21,7 @@ gRPC is used **internally** between services for low-latency paths (search ↔ e
 
 ## 1. `POST /api/v1/ai/upload-listing`: multimodal ingestion
 
-Turns raw media into a structured, SEO-ready, optionally verified listing. Content type: `multipart/form-data`.
+Turns raw media into a structured, SEO-ready, optionally verified listing. Content type: `multipart/form-data`. **Requires sign-in.** Listing as `owner` grants that role automatically; `agent` and `developer` need a verified account (otherwise `403`).
 
 | Field | Type | Req. | Description |
 |---|---|---|---|
@@ -29,7 +29,6 @@ Turns raw media into a structured, SEO-ready, optionally verified listing. Conte
 | `documents` | file[] | | Legal documents (PDF/JPG/PNG): RERA certificate, title or sale deed, OC/CC, EC, khata, tax receipt. Triggers verification. |
 | `transcript` | string | | Client-side speech-to-text, if already available (Web Speech API, WhatsApp voice transcript). |
 | `notes` | string ≤ 5000 | | Free text from the seller. |
-| `owner_id` | string | | MVP only. Prod takes it from the JWT. |
 | `owner_role` | `owner`\|`agent`\|`developer` | | Default `owner`. |
 | `auto_publish` | bool | | Default `true`. The listing goes `live` if the critical fields (price, area, city, and BHK for residential) are present and legal verification did not fail. |
 
@@ -53,7 +52,7 @@ curl -X POST http://localhost:8000/api/v1/ai/upload-listing \
   "timings_ms": {"normalise": 4120, "extract": 21850, "reconcile": 2, "verify": 18400, "index": 9},
   "listing": {
     "id": "lst_8f2a91c0d3e4",
-    "owner_id": "usr_17", "owner_role": "owner", "status": "live",
+    "owner_id": "5b0e7c1a-…", "owner_role": "owner", "status": "live",
     "quality_score": 0.912,
     "data": {
       "transaction_type": "sale", "property_type": "apartment", "bhk": 3, "bathrooms": 3, "balconies": 2,
@@ -86,6 +85,7 @@ curl -X POST http://localhost:8000/api/v1/ai/upload-listing \
 
 Behaviour:
 
+- Originals are stored content-addressed (`listing.media` holds the keys, served at `/api/v1/media/{key}`). Legal documents go to private storage.
 - When critical fields are missing, the response has `status: "draft"` and `clarifying_questions[]`. The seller answers, by voice or text, through the same endpoint (prod: `PATCH /listings/{id}`).
 - `warnings[]` lists everything that was skipped or auto-corrected (a missing ffmpeg or STT, unit fixes, oversize images).
 - Errors: `413` for a file over the size limit. `422` when there is no input, or when there is no LLM key and only images were sent (the offline parser needs text).
@@ -99,7 +99,6 @@ Behaviour:
 | Field | Type | Description |
 |---|---|---|
 | `query` | string 2–1000 | Any language or style, e.g. *"Show me a sunlit 3BHK near tech hubs under ₹1.5 Cr with low maintenance and east facing"*. |
-| `user_id` | string? | Enables predictive matching (updates the buyer profile) and personalisation. |
 | `limit` | int 1–50 | Default 10. |
 | `filters_override` | `SearchFilters`? | Sent when the user removes or edits a filter chip, so the query is not re-parsed. |
 
@@ -135,7 +134,8 @@ Behaviour:
 
 - `relaxed_filters` is non-empty when fewer than 3 homes matched exactly. Constraints are loosened in a fixed order: facing → locality → budget +15% → BHK ±1. The UI tells the user.
 - `parsed.clarification` is set only when nothing searchable could be derived. The UI shows it as the assistant's reply.
-- Side effect: emits `search.performed.v1`. If `user_id` is present, the buyer profile used for proactive alerts is updated.
+- Auth: optional. When the caller is signed in, the search updates their buyer profile, which drives proactive alerts.
+- Side effect: emits `search.performed.v1`.
 
 ---
 
@@ -149,7 +149,6 @@ Behaviour:
 | `message` | string 1–4000 | User text. |
 | `listing_id` | string? | The property the chat is about. Enables grounded Q&A and booking. |
 | `channel` | `web`\|`whatsapp`\|`app` | |
-| `user_id` | string? | |
 
 **`200 OK`**
 
@@ -194,17 +193,41 @@ Side effects:
 
 ---
 
+## Authentication
+
+Phone number + one-time code. There are no passwords.
+
+| Method & path | Body | Result |
+|---|---|---|
+| `POST /api/v1/auth/otp/request` | `{phone}` (any Indian format; bare 10-digit numbers get `+91`) | `{phone_e164, expires_in, dev_code}`. `dev_code` is `null` unless `APT_DEV_OTP_IN_RESPONSE=true` (local development only; refused when `APT_ENV=prod`). Otherwise the code is only sent by SMS. |
+| `POST /api/v1/auth/otp/verify` | `{phone, code, full_name?}` | `{user, access_expires_in}` and sets cookies. Creates the account on first login. |
+| `POST /api/v1/auth/refresh` | none (cookie) or `{refresh_token}` | Rotates the refresh token and issues a new access token. |
+| `POST /api/v1/auth/logout` | none (cookie) or `{refresh_token}` | `204`. Revokes the refresh token's whole chain and clears cookies. |
+| `GET /api/v1/auth/me` | | The signed-in `User` (`id`, `phone_e164`, `full_name`, `roles`). |
+| `POST /api/v1/auth/roles` | `{role}` | Self-service `buyer` / `owner`. `agent`, `developer` and `admin` return `403` (they need KYC / org verification). |
+
+How it works:
+
+- **Codes**: 6 digits, valid 5 minutes, single use. Stored only as an HMAC. At most 5 codes per number per hour and 5 wrong guesses per code (`429` after that).
+- **Access token**: HS256 JWT, 15 minutes, carries `sub` and `roles`. Roles are re-read from the database on every request, so a role change takes effect immediately.
+- **Refresh token**: random 256-bit value, 30 days, stored as a SHA-256 hash. Each refresh replaces it. If an already-replaced token is presented again, the whole chain is revoked and every device on it must sign in again (protection against a stolen token).
+- **Web clients** get `apt_at` (path `/api`) and `apt_rt` (path `/api/v1/auth`) as httpOnly, `SameSite=Strict` cookies, `Secure` in prod. The frontend client refreshes automatically on a `401` and retries once.
+- **Native/API clients** send `X-Auth-Mode: token` on verify/refresh to get `access_token` and `refresh_token` in the body instead of cookies.
+- A request with an **invalid or expired token gets `401` even on endpoints that allow guests**, so clients refresh rather than silently continuing as a guest.
+- `APT_ENV=prod` refuses to start without a strong `APT_JWT_SECRET` and a `DATABASE_URL`, or with `APT_DEV_OTP_IN_RESPONSE` enabled.
+
 ## Supporting endpoints (MVP)
 
 | Method & path | Purpose |
 |---|---|
 | `POST /api/v1/ai/affordability` | `{monthly_income_inr, existing_emi_inr?, down_payment_inr?, target_price_inr?}` → FOIR/LTV `Affordability` (max EMI, max loan, max price, EMI for target, verdict). |
-| `GET /api/v1/listings/{id}` | Full listing. |
-| `PATCH /api/v1/listings/{id}/price` | `{price_inr}`. Records history and emits `listing.price_changed.v1`, which drives price-drop alerts. |
-| `GET /api/v1/notifications?user_id=` | Notification outbox. WhatsApp items include the exact Cloud API `provider_payload`. |
-| `GET /api/v1/events?limit=` | Recent domain events (debug). |
-| `GET/POST /api/v1/webhooks/whatsapp` | Meta verification handshake. Inbound messages are routed to the concierge, and `referral.ref` from Click-to-WhatsApp ads selects the listing. |
-| `GET /healthz` | Liveness, LLM-enabled flag and listing count. |
+| `GET /api/v1/listings/{id}` | Full listing. Drafts are visible only to their owner (`404` for everyone else). A signed-in viewer's visit is recorded for price-drop alerts. |
+| `PATCH /api/v1/listings/{id}/price` | **Owner or admin.** `{price_inr}`. Records history and emits `listing.price_changed.v1`, which drives price-drop alerts. |
+| `GET /api/v1/notifications` | **Signed in.** The caller's notifications. Admins may pass `?user_id=`. WhatsApp items include the exact Cloud API `provider_payload`. |
+| `GET /api/v1/events?limit=` | **Admin.** Recent domain events (from `outbox_events` on Postgres). |
+| `GET /api/v1/media/{key}` | Public listing media by content-addressed key. Legal documents are stored privately and never served here. |
+| `GET/POST /api/v1/webhooks/whatsapp` | Meta verification handshake. Inbound messages must carry a valid `X-Hub-Signature-256` (HMAC with `WHATSAPP_APP_SECRET`; required in prod). The sender's number identifies the user, the conversation continues across messages, and `referral.ref` from Click-to-WhatsApp ads selects the listing. |
+| `GET /healthz` | Liveness, storage backend, LLM-enabled flag and listing count. |
 
 ---
 

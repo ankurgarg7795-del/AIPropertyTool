@@ -2,8 +2,8 @@
 
 In production the bus is Kafka (topics listed in docs/ARCHITECTURE.md §3.2)
 and each consumer is its own worker deployment. Here it is an in-process
-async pub/sub with the same CloudEvents-style envelope, so handlers can be
-lifted into workers unchanged.
+async pub/sub with the same CloudEvents envelope; every published event is
+also appended to the database (``outbox_events`` on Postgres) for relay.
 """
 
 from __future__ import annotations
@@ -12,74 +12,32 @@ import logging
 from collections import defaultdict
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Awaitable, Callable
-from uuid import uuid4
 
-from pydantic import BaseModel, Field
-
-from app.schemas import Listing, ParsedQuery, SearchFilters
+from app.db.base import Database
+from app.schemas import BuyerProfile, Event, Listing, Notification, ParsedQuery
+from app.search.rules import matches, preference_tags
 
 log = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
-
-
-class Event(BaseModel):
-    """CloudEvents 1.0 compatible envelope."""
-
-    specversion: str = "1.0"
-    id: str = Field(default_factory=lambda: f"evt_{uuid4().hex}")
-    type: str  # e.g. "listing.price_changed.v1"
-    source: str  # e.g. "/svc/listing"
-    subject: str | None = None  # aggregate id
-    time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    partitionkey: str | None = None
-    data: dict[str, Any]
-
 
 Handler = Callable[[Event], Awaitable[None]]
 
 
 class EventBus:
-    def __init__(self) -> None:
+    def __init__(self, db: Database) -> None:
+        self.db = db
         self._subs: dict[str, list[Handler]] = defaultdict(list)
-        self.log: list[Event] = []
 
     def subscribe(self, event_type: str, handler: Handler) -> None:
         self._subs[event_type].append(handler)
 
     async def publish(self, event: Event) -> None:
-        self.log.append(event)
-        self.log = self.log[-1000:]
+        await self.db.append_event(event)
         for h in self._subs.get(event.type, []):
             try:
                 await h(event)
             except Exception:  # a failing consumer must not break the producer
                 log.exception("handler failed for %s", event.type)
-
-
-# --------------------------------------------------------------------------- #
-# Buyer intent profiles (built from searches; consumed by predictive matching)
-# --------------------------------------------------------------------------- #
-class BuyerProfile(BaseModel):
-    user_id: str
-    filters: SearchFilters
-    soft_preferences: list[str] = Field(default_factory=list)
-    searches: int = 0
-    viewed_listing_ids: list[str] = Field(default_factory=list)
-    channels: list[str] = Field(default_factory=lambda: ["push", "whatsapp"])
-    phone_e164: str | None = None
-    whatsapp_opt_in: bool = False
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-class Notification(BaseModel):
-    id: str = Field(default_factory=lambda: f"ntf_{uuid4().hex[:12]}")
-    user_id: str
-    kind: str  # new_match | price_drop | visit_reminder | lead_routed
-    channel: str
-    dedup_key: str
-    payload: dict[str, Any]
-    scheduled_for: datetime
-    status: str = "queued"
 
 
 class NotificationEngine:
@@ -88,11 +46,10 @@ class NotificationEngine:
 
     QUIET_START, QUIET_END = time(22, 0), time(8, 0)
 
-    def __init__(self) -> None:
-        self.outbox: list[Notification] = []
-        self._seen: set[str] = set()
+    def __init__(self, db: Database) -> None:
+        self.db = db
 
-    def _deliver_at(self, channel: str, now: datetime) -> datetime:
+    def deliver_at(self, channel: str, now: datetime) -> datetime:
         local = now.astimezone(IST)
         quiet = local.time() >= self.QUIET_START or local.time() < self.QUIET_END
         if channel in ("whatsapp", "sms") and quiet:
@@ -100,21 +57,18 @@ class NotificationEngine:
             return nxt.replace(hour=8, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         return now
 
-    def enqueue(self, profile: BuyerProfile, kind: str, dedup_key: str, payload: dict[str, Any],
-                now: datetime | None = None) -> list[Notification]:
+    async def enqueue(self, profile: BuyerProfile, kind: str, dedup_key: str, payload: dict[str, Any],
+                      now: datetime | None = None) -> list[Notification]:
         now = now or datetime.now(timezone.utc)
         out = []
         for ch in profile.channels:
             if ch == "whatsapp" and not (profile.whatsapp_opt_in and profile.phone_e164):
                 continue
-            key = f"{profile.user_id}:{ch}:{dedup_key}"
-            if key in self._seen:
-                continue
-            self._seen.add(key)
-            n = Notification(user_id=profile.user_id, kind=kind, channel=ch, dedup_key=key,
-                             payload=payload, scheduled_for=self._deliver_at(ch, now))
-            self.outbox.append(n)
-            out.append(n)
+            n = Notification(user_id=profile.user_id, kind=kind, channel=ch,
+                             dedup_key=f"{profile.user_id}:{ch}:{dedup_key}", payload=payload,
+                             scheduled_for=self.deliver_at(ch, now))
+            if await self.db.add_notification(n):
+                out.append(n)
         return out
 
 
@@ -157,36 +111,48 @@ def fmt_inr(v: float | None) -> str:
 
 class MatchingEngine:
     """Predictive matching: every new or re-priced listing is scored against
-    active buyer profiles (reverse search), and every search refines a profile."""
+    signed-in buyers' profiles (reverse search), and every search refines a profile."""
 
-    def __init__(self, bus: EventBus, notifier: NotificationEngine):
-        self.bus = bus
-        self.notifier = notifier
-        self.profiles: dict[str, BuyerProfile] = {}
+    def __init__(self, db: Database, bus: EventBus, notifier: NotificationEngine):
+        self.db, self.bus, self.notifier = db, bus, notifier
         bus.subscribe("search.performed.v1", self.on_search)
         bus.subscribe("listing.published.v1", self.on_listing)
         bus.subscribe("listing.price_changed.v1", self.on_price_change)
 
-    def update_profile(self, user_id: str, parsed: ParsedQuery) -> BuyerProfile:
-        prof = self.profiles.get(user_id)
+    async def _profile_for(self, user_id: str, parsed: ParsedQuery | None = None) -> BuyerProfile | None:
+        prof = await self.db.get_profile(user_id)
+        if prof:
+            return prof
+        user = await self.db.get_user(user_id)
+        if not user:
+            return None
+        return BuyerProfile(user_id=user_id, filters=parsed.filters if parsed else {},
+                            phone_e164=user.phone_e164, whatsapp_opt_in=user.whatsapp_opt_in)
+
+    async def update_profile(self, user_id: str, parsed: ParsedQuery) -> BuyerProfile | None:
+        prof = await self._profile_for(user_id, parsed)
         if not prof:
-            prof = BuyerProfile(user_id=user_id, filters=parsed.filters)
-            self.profiles[user_id] = prof
-        else:
-            # Latest explicit constraints win; soft preferences accumulate (bounded).
-            prof.filters = parsed.filters
+            return None
+        # Latest explicit constraints win; soft preferences accumulate (bounded).
+        prof.filters = parsed.filters
         prof.soft_preferences = list(dict.fromkeys(parsed.soft_preferences + prof.soft_preferences))[:8]
         prof.searches += 1
         prof.updated_at = datetime.now(timezone.utc)
+        await self.db.save_profile(prof)
         return prof
+
+    async def record_view(self, user_id: str, listing_id: str) -> None:
+        prof = await self.db.get_profile(user_id)
+        if prof and listing_id not in prof.viewed_listing_ids:
+            prof.viewed_listing_ids = (prof.viewed_listing_ids + [listing_id])[-50:]
+            await self.db.save_profile(prof)
 
     async def on_search(self, e: Event) -> None:
         if e.data.get("user_id"):
-            self.update_profile(e.data["user_id"], ParsedQuery.model_validate(e.data["parsed"]))
+            await self.update_profile(e.data["user_id"], ParsedQuery.model_validate(e.data["parsed"]))
 
-    def _profile_matches(self, prof: BuyerProfile, listing: Listing) -> tuple[bool, list[str]]:
-        from app.search.store import matches, preference_tags
-
+    @staticmethod
+    def profile_matches(prof: BuyerProfile, listing: Listing) -> tuple[bool, list[str]]:
         if not matches(listing, prof.filters):
             return False, []
         why = sorted({p.lower() for p in prof.soft_preferences} & preference_tags(listing))
@@ -196,10 +162,12 @@ class MatchingEngine:
 
     async def on_listing(self, e: Event) -> None:
         listing = Listing.model_validate(e.data["listing"])
-        for prof in list(self.profiles.values()):
-            ok, why = self._profile_matches(prof, listing)
+        for prof in await self.db.list_profiles():
+            if prof.user_id == listing.owner_id:
+                continue
+            ok, why = self.profile_matches(prof, listing)
             if ok:
-                self.notifier.enqueue(prof, "new_match", f"match:{listing.id}", {
+                await self.notifier.enqueue(prof, "new_match", f"match:{listing.id}", {
                     "listing_id": listing.id, "title": listing.data.seo_title,
                     "price_fmt": fmt_inr(listing.data.price_inr), "why": why})
 
@@ -209,9 +177,11 @@ class MatchingEngine:
         if new >= old:
             return
         pct = round((old - new) / old * 100, 1)
-        for prof in list(self.profiles.values()):
-            ok, _ = self._profile_matches(prof, listing)
+        for prof in await self.db.list_profiles():
+            if prof.user_id == listing.owner_id:
+                continue
+            ok, _ = self.profile_matches(prof, listing)
             if ok or listing.id in prof.viewed_listing_ids:
-                self.notifier.enqueue(prof, "price_drop", f"drop:{listing.id}:{int(new)}", {
+                await self.notifier.enqueue(prof, "price_drop", f"drop:{listing.id}:{int(new)}", {
                     "listing_id": listing.id, "title": listing.data.seo_title,
                     "old_price_fmt": fmt_inr(old), "new_price_fmt": fmt_inr(new), "drop_pct": f"{pct}%"})

@@ -8,6 +8,7 @@ friendly: no free-form dicts, enums as ``Literal``.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Literal
 from uuid import uuid4
 
@@ -193,7 +194,6 @@ class ParsedQuery(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=1000)
-    user_id: str | None = None
     limit: int = Field(default=10, ge=1, le=50)
     filters_override: SearchFilters | None = None
 
@@ -238,7 +238,6 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     listing_id: str | None = None
     channel: Literal["web", "whatsapp", "app"] = "web"
-    user_id: str | None = None
 
 
 class ChatAction(BaseModel):
@@ -253,3 +252,117 @@ class ChatResponse(BaseModel):
     lead_score: int
     slots: dict
     actions: list[ChatAction] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Users & auth
+# --------------------------------------------------------------------------- #
+Role = Literal["buyer", "owner", "agent", "developer", "project_marketer", "admin"]
+
+
+class User(BaseModel):
+    id: str
+    phone_e164: str | None = None
+    full_name: str | None = None
+    roles: list[Role] = Field(default_factory=lambda: ["buyer"])
+    whatsapp_opt_in: bool = False
+    created_at: datetime = Field(default_factory=_now)
+
+
+# --------------------------------------------------------------------------- #
+# Events, buyer profiles, notifications
+# --------------------------------------------------------------------------- #
+class Event(BaseModel):
+    """CloudEvents 1.0 compatible envelope."""
+
+    specversion: str = "1.0"
+    id: str = Field(default_factory=lambda: f"evt_{uuid4().hex}")
+    type: str  # e.g. "listing.price_changed.v1"
+    source: str  # e.g. "/svc/listing"
+    subject: str | None = None  # aggregate id
+    time: datetime = Field(default_factory=_now)
+    partitionkey: str | None = None
+    data: dict
+
+
+class BuyerProfile(BaseModel):
+    user_id: str
+    filters: SearchFilters
+    soft_preferences: list[str] = Field(default_factory=list)
+    searches: int = 0
+    viewed_listing_ids: list[str] = Field(default_factory=list)
+    channels: list[str] = Field(default_factory=lambda: ["push", "whatsapp"])
+    phone_e164: str | None = None
+    whatsapp_opt_in: bool = False
+    updated_at: datetime = Field(default_factory=_now)
+
+
+class Notification(BaseModel):
+    id: str = Field(default_factory=lambda: f"ntf_{uuid4().hex[:12]}")
+    user_id: str
+    kind: str  # new_match | price_drop | visit_reminder | lead_routed
+    channel: str
+    dedup_key: str
+    payload: dict
+    scheduled_for: datetime
+    status: str = "queued"
+
+
+# --------------------------------------------------------------------------- #
+# Scheduling & concierge sessions
+# --------------------------------------------------------------------------- #
+class Slot(BaseModel):
+    slot_id: str
+    start: datetime
+    end: datetime
+    label: str
+
+
+class Booking(BaseModel):
+    booking_id: str = Field(default_factory=lambda: f"bkg_{uuid4().hex[:10]}")
+    listing_id: str
+    session_id: str
+    slot: Slot
+    host_id: str
+    buyer_id: str | None = None
+    lead_score: int = 0
+    status: str = "confirmed"
+
+
+class ConciergeState(str, Enum):
+    GREETING = "GREETING"
+    INTENT = "INTENT"
+    BUDGET = "BUDGET"
+    TIMELINE = "TIMELINE"
+    FINANCING = "FINANCING"
+    QUALIFIED = "QUALIFIED"
+    SLOT_OFFERED = "SLOT_OFFERED"
+    BOOKED = "BOOKED"
+    HANDOFF = "HANDOFF"
+
+
+class ConciergeSlots(BaseModel):
+    intent: str | None = None  # buy | rent | invest
+    budget_max_inr: float | None = None
+    timeline_months: int | None = None
+    needs_loan: bool | None = None
+    monthly_income_inr: float | None = None
+    existing_emi_inr: float | None = None
+    name: str | None = None
+    phone: str | None = None
+    preapproval: dict | None = None
+    offered_slots: list[Slot] = Field(default_factory=list)
+    booking_id: str | None = None
+
+
+class ConciergeSession(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    state: ConciergeState = ConciergeState.GREETING
+    listing_id: str | None = None
+    user_id: str | None = None
+    channel: str = "web"
+    external_thread: str | None = None  # e.g. WhatsApp wa_id
+    slots: ConciergeSlots = Field(default_factory=ConciergeSlots)
+    history: list[dict[str, str]] = Field(default_factory=list)
+    misses: int = 0
+    lead_score: int = 0

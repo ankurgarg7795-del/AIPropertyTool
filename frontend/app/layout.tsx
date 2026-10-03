@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { AuthProvider } from "@/components/AuthProvider";
+import NavAuth from "@/components/NavAuth";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -11,14 +13,17 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en-IN">
       <body>
+        <AuthProvider>
         <nav className="nav">
           <Link href="/" className="brand">AIPropertyTool</Link>
           <div>
             <Link href="/">Find a home</Link>
             <Link href="/sell">List for free</Link>
+            <NavAuth />
           </div>
         </nav>
         <main>{children}</main>
+        </AuthProvider>
       </body>
     </html>
   );

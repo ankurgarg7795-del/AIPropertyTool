@@ -15,57 +15,25 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import Any
-from uuid import uuid4
-
-from pydantic import BaseModel, Field
 
 from app.concierge.finance import assess
-from app.concierge.scheduler import Booking, Scheduler, Slot
-from app.core.events import Event, EventBus, fmt_inr
+from app.concierge.scheduler import Scheduler, SlotTaken
+from app.core.events import EventBus, fmt_inr
 from app.core.heuristics import parse_money
 from app.core.llm import LLM, LLMError
 from app.prompts import CONCIERGE_SYSTEM
-from app.schemas import ChatAction, ChatRequest, ChatResponse, Listing
-from app.search.store import ListingStore
+from app.db.base import Database
+from app.schemas import (
+    Booking, ChatAction, ChatRequest, ChatResponse, ConciergeSession, ConciergeSlots, ConciergeState, Event, Listing,
+    Slot, User,
+)
+from app.search.store import ListingIndex
 
 
-class State(str, Enum):
-    GREETING = "GREETING"
-    INTENT = "INTENT"
-    BUDGET = "BUDGET"
-    TIMELINE = "TIMELINE"
-    FINANCING = "FINANCING"
-    QUALIFIED = "QUALIFIED"
-    SLOT_OFFERED = "SLOT_OFFERED"
-    BOOKED = "BOOKED"
-    HANDOFF = "HANDOFF"
-
-
-class Slots(BaseModel):
-    intent: str | None = None  # buy | rent | invest
-    budget_max_inr: float | None = None
-    timeline_months: int | None = None
-    needs_loan: bool | None = None
-    monthly_income_inr: float | None = None
-    existing_emi_inr: float | None = None
-    name: str | None = None
-    phone: str | None = None
-    preapproval: dict | None = None
-    offered_slots: list[Slot] = Field(default_factory=list)
-    booking_id: str | None = None
-
-
-class Session(BaseModel):
-    id: str = Field(default_factory=lambda: f"ses_{uuid4().hex[:12]}")
-    state: State = State.GREETING
-    listing_id: str | None = None
-    user_id: str | None = None
-    channel: str = "web"
-    slots: Slots = Field(default_factory=Slots)
-    history: list[dict[str, str]] = Field(default_factory=list)
-    misses: int = 0
+State = ConciergeState
+Session = ConciergeSession
+Slots = ConciergeSlots
 
 
 GOALS = {
@@ -196,13 +164,12 @@ def listing_facts(listing: Listing | None) -> str:
 
 
 class Concierge:
-    def __init__(self, store: ListingStore, llm: LLM, bus: EventBus, scheduler: Scheduler):
-        self.store, self.llm, self.bus, self.scheduler = store, llm, bus, scheduler
-        self.sessions: dict[str, Session] = {}
+    def __init__(self, db: Database, store: ListingIndex, llm: LLM, bus: EventBus, scheduler: Scheduler):
+        self.db, self.store, self.llm, self.bus, self.scheduler = db, store, llm, bus, scheduler
 
     # ---- state machine --------------------------------------------------- #
-    def _advance(self, s: Session, text: str, listing: Listing | None
-                 ) -> tuple[str, list[ChatAction], Booking | None]:
+    async def _advance(self, s: Session, text: str, listing: Listing | None
+                       ) -> tuple[str, list[ChatAction], Booking | None]:
         """Consume the user message, fill slots, transition. Returns a template reply."""
         sl = s.slots
         actions: list[ChatAction] = []
@@ -233,9 +200,10 @@ class Concierge:
             choice = extract_slot_choice(text, sl.offered_slots)
             if choice and listing:
                 try:
-                    booking = self.scheduler.book(listing.id, s.id, listing.owner_id, choice)
-                except ValueError:
-                    sl.offered_slots = self.scheduler.available(listing.owner_id)
+                    booking = await self.scheduler.book(listing.id, s.id, listing.owner_id, choice,
+                                                        buyer_id=s.user_id, lead_score=lead_score(sl, listing))
+                except SlotTaken:
+                    sl.offered_slots = await self.scheduler.available(listing.owner_id)
                     return "That slot was just taken. Here are the next available ones.", [ChatAction(
                         type="offer_slots", payload={"slots": [x.model_dump(mode="json") for x in sl.offered_slots]})], None
                 sl.booking_id = booking.booking_id
@@ -267,7 +235,7 @@ class Concierge:
 
         if s.state == State.QUALIFIED:
             if listing:
-                sl.offered_slots = self.scheduler.available(listing.owner_id)
+                sl.offered_slots = await self.scheduler.available(listing.owner_id)
                 s.state = State.SLOT_OFFERED
                 lines = "\n".join(f"{i + 1}. {x.label}" for i, x in enumerate(sl.offered_slots))
                 pre = ""
@@ -293,30 +261,40 @@ class Concierge:
 
     async def _phrase(self, s: Session, user_text: str, template: str, listing: Listing | None,
                       is_question: bool) -> str:
-        if not self.llm.enabled:
-            if is_question and listing:
-                return f"Here's what I know about this home:\n{listing_facts(listing)}\n\n{template}"
-            return template
+        if self.llm.enabled:
+            try:
+                return await self._phrase_llm(s, user_text, template, listing)
+            except LLMError:
+                pass  # degrade to the deterministic reply below
+        if is_question and listing:
+            return f"Here's what I know about this home:\n{listing_facts(listing)}\n\n{template}"
+        return template
+
+    async def _phrase_llm(self, s: Session, user_text: str, template: str, listing: Listing | None) -> str:
         state_note = (f"LISTING FACTS:\n{listing_facts(listing)}\n\nCONVERSATION STATE: {s.state.value}\n"
                       f"NEXT GOAL: {GOALS.get(s.state, '')}\n"
                       f"REQUIRED CONTENT (keep every number/date/slot exactly): {template}")
         msgs = s.history[-10:] + [{"role": "user", "content": f"{user_text}\n\n<context>\n{state_note}\n</context>"}]
-        try:
-            return await self.llm.reply(system=CONCIERGE_SYSTEM, messages=msgs)
-        except LLMError:
-            return template
+        return await self.llm.reply(system=CONCIERGE_SYSTEM, messages=msgs)
 
-    async def handle(self, req: ChatRequest) -> ChatResponse:
-        s = self.sessions.get(req.session_id or "")
+    async def handle(self, req: ChatRequest, user: User | None = None, external_thread: str | None = None,
+                     session: Session | None = None) -> ChatResponse:
+        """``user`` is the authenticated caller; a session bound to a user can only be
+        continued by that user (session ids are not bearer credentials)."""
+        s = session or (await self.db.get_session(req.session_id) if req.session_id else None)
+        if s and s.user_id and (not user or user.id != s.user_id):
+            s = None
         if not s:
-            s = Session(listing_id=req.listing_id, user_id=req.user_id, channel=req.channel)
-            self.sessions[s.id] = s
+            s = Session(listing_id=req.listing_id, user_id=user.id if user else None, channel=req.channel,
+                        external_thread=external_thread)
+        elif user and not s.user_id:
+            s.user_id = user.id  # guest signed in mid-conversation
         if req.listing_id:
             s.listing_id = req.listing_id
-        listing = self.store.get(s.listing_id) if s.listing_id else None
+        listing = await self.store.get(s.listing_id) if s.listing_id else None
 
         is_question = bool(QUESTION_RE.search(req.message.strip())) and s.state != State.SLOT_OFFERED
-        template, actions, booking = self._advance(s, req.message, listing)
+        template, actions, booking = await self._advance(s, req.message, listing)
         score = lead_score(s.slots, listing)
         if s.misses >= 3 or (score >= 80 and s.state == State.BOOKED):
             reason = "stuck" if s.misses >= 3 else "hot_lead"
@@ -329,7 +307,10 @@ class Concierge:
                                                "lead_score": score, "slots": s.slots.model_dump(mode="json")}))
 
         reply = await self._phrase(s, req.message, template, listing, is_question)
-        s.history += [{"role": "user", "content": req.message}, {"role": "assistant", "content": reply}]
+        new_msgs = [{"role": "user", "content": req.message}, {"role": "assistant", "content": reply}]
+        s.history += new_msgs
+        s.lead_score = score
+        await self.db.save_session(s, new_msgs)
 
         if booking:
             b = booking
