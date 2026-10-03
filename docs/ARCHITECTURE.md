@@ -85,6 +85,8 @@ flowchart LR
 
 **Request path vs. event path.** Synchronous APIs only do work that the user is waiting for: parsing a search, returning a chat reply, accepting an upload. Anything that fans out goes through the event path: a new listing triggers matching, which triggers notifications and CRM updates. Every service writes its domain events to an `outbox_events` table in the same transaction as its state change. Debezium relays the outbox to Kafka, so no event is lost and none is published for a rolled-back write.
 
+> **MVP status:** the backend persists to PostgreSQL when `DATABASE_URL` is set (in-memory otherwise). Every published event is written to `outbox_events`, but in a separate statement from the state change, not yet the same transaction. Consumers run in-process rather than as Kafka workers.
+
 ### 1.2 Tech stack
 
 | Layer | Choice | Why |
@@ -137,6 +139,7 @@ flowchart LR
 | Search latency | p95 < 600 ms. The parse step uses `effort: low` and is cached by normalised query in Redis for 24 h. Retrieval is a single SQL round-trip. |
 | Ingestion | p95 < 90 s for 20 photos plus a 2-minute video. The upload returns `202` with a job id. The UI subscribes over SSE. (The MVP is synchronous.) |
 | Cost control | Static system prompts are prompt-cached. Images are downscaled to a 1568 px long edge. At most 20 images per extraction. Query-parse cache. Batch API for nightly re-extractions. |
+| Identity | Phone OTP login, 15-minute JWT access tokens, rotating 30-day refresh tokens with reuse detection, httpOnly `SameSite=Strict` cookies for web. Caller identity comes only from the token. Owners alone can change their listings, drafts are private, notifications are per user, the event log is admin-only, and WhatsApp webhooks are HMAC-verified. (MVP: implemented. Prod adds an SMS provider, KYC for agent/developer roles and per-IP rate limits at the gateway.) |
 | Safety | Document-derived text is treated as data, never as instructions. Badges are issued by rule checks only, never by the model (§2.4). Phone numbers are masked until a visit is booked. PII is encrypted at rest. |
 | Trust | Every AI field carries `field_confidence` and a `source`. Low-confidence critical fields become clarifying questions instead of being published. |
 
@@ -328,6 +331,7 @@ erDiagram
 | `appointments` | `slot tstzrange` + **`EXCLUDE USING gist (host_id WITH =, slot WITH &&)`** | Double-booking is impossible at the database level. |
 | `transactions` | status pipeline (token → agreement → loan → registration), agreement_draft_key | Seller agreement-of-sale automation. |
 | `outbox_events` | aggregate_type, aggregate_id (partition key), type, payload | Transactional outbox → Debezium → Kafka. |
+| `auth_otps`, `auth_refresh_tokens` (003) | code HMAC, attempts, send window; token hash, family, expiry, revoked_at | Phone OTP login and refresh-token rotation with family revocation. |
 | `notifications` | dedup_key UNIQUE, channel, template, scheduled_for, status, provider_msg_id | Idempotent fan-out. |
 
 ### 3.2 Event schema (event-driven alerts)

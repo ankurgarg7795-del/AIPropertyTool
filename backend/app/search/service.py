@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import logging
 
-from app.core.events import Event, EventBus
+from app.core.events import EventBus
 from app.core.heuristics import parse_query
 from app.core.llm import LLM, LLMError, text_block
 from app.prompts import QUERY_PARSER_SYSTEM
-from app.schemas import ParsedQuery, ScoreBreakdown, SearchHit, SearchRequest, SearchResponse
-from app.search.store import ListingStore
+from app.schemas import Event, ParsedQuery, ScoreBreakdown, SearchHit, SearchRequest, SearchResponse
+from app.search.store import ListingIndex
 
 log = logging.getLogger(__name__)
 MIN_RESULTS = 3
@@ -43,17 +43,19 @@ def _relaxations(parsed: ParsedQuery):
         yield "BHK ±1", f.model_copy(deep=True)
 
 
-async def search(req: SearchRequest, store: ListingStore, llm: LLM, bus: EventBus) -> SearchResponse:
+async def search(req: SearchRequest, store: ListingIndex, llm: LLM, bus: EventBus,
+                 user_id: str | None = None) -> SearchResponse:
+    """``user_id`` comes from the authenticated caller, never from the request body."""
     parsed, used_llm = await parse(llm, req.query)
     if req.filters_override:
         parsed.filters = req.filters_override
-    results, total = store.search(parsed.filters, parsed.semantic_query, parsed.soft_preferences, req.limit)
+    results, total = await store.search(parsed.filters, parsed.semantic_query, parsed.soft_preferences, req.limit)
     relaxed: list[str] = []
     # Relax on the candidate count, not the page size, so a small `limit` never loosens filters.
     if total < MIN_RESULTS:
         for label, f in _relaxations(parsed):
             relaxed.append(label)
-            results, total = store.search(f, parsed.semantic_query, parsed.soft_preferences, req.limit)
+            results, total = await store.search(f, parsed.semantic_query, parsed.soft_preferences, req.limit)
             if total >= MIN_RESULTS:
                 break
 
@@ -71,9 +73,9 @@ async def search(req: SearchRequest, store: ListingStore, llm: LLM, bus: EventBu
             city=d.address.city, locality=d.address.locality, facing=d.facing,
             verified=lst.is_verified, why=reasons))
 
-    await bus.publish(Event(type="search.performed.v1", source="/svc/search", subject=req.user_id,
-                            partitionkey=req.user_id,
-                            data={"user_id": req.user_id, "query": req.query, "parsed": parsed.model_dump(),
+    await bus.publish(Event(type="search.performed.v1", source="/svc/search", subject=user_id,
+                            partitionkey=user_id,
+                            data={"user_id": user_id, "query": req.query, "parsed": parsed.model_dump(),
                                   "result_ids": [h.listing_id for h in hits]}))
     return SearchResponse(query=req.query, parsed=parsed, total_candidates=total, hits=hits,
                           relaxed_filters=relaxed, llm_used=used_llm)

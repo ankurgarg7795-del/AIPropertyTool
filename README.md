@@ -23,8 +23,10 @@ An AI-native, zero-friction, free-to-list real-estate portal for India.
 cd backend
 pip install -e ".[dev]"            # add ".[media]" for Pillow + faster-whisper
 export ANTHROPIC_API_KEY=...       # optional
+export APT_DEV_OTP_IN_RESPONSE=true  # show login codes on screen (local only)
+export DATABASE_URL=...            # optional; omit to keep data in memory
 uvicorn app.main:app --reload      # http://localhost:8000/docs
-pytest                             # 29 tests, no network needed
+pytest                             # no network needed; set TEST_DATABASE_URL to also run every API test on Postgres
 
 # Frontend
 cd frontend
@@ -32,7 +34,23 @@ npm install
 npm run dev                        # http://localhost:3000  (proxies /api/v1 → :8000)
 ```
 
-Or run everything with `cp .env.example .env && docker compose up`. This also starts Postgres with pgvector, with `backend/sql` applied, plus Redis and Kafka.
+Or run everything with `cp .env.example .env && docker compose up`. The API uses Postgres with pgvector and applies `backend/sql` migrations itself on startup. Redis and Kafka are provisioned but not used by the MVP process yet.
+
+### Storage
+
+With `DATABASE_URL` unset, the backend keeps everything in memory, which is handy for quick local runs and is what the plain `pytest` run uses. With `DATABASE_URL` set it uses PostgreSQL: listings, embeddings, price history, verifications, users and sessions, buyer profiles, notifications, leads, appointments and the event outbox all persist. Migrations run automatically on startup (`APT_AUTO_MIGRATE`) or with `python -m app.db.migrate`. Uploaded media is stored content-addressed under `APT_MEDIA_DIR`.
+
+### Sign-in
+
+Users sign in with their mobile number and a one-time code. For local development, `APT_DEV_OTP_IN_RESPONSE=true` (already set in `.env.example`) shows the code on the login page instead of texting it. Production refuses to start with it enabled. A real SMS provider still needs to be plugged into `app/auth/service.py` (`SmsSender`). See [docs/API.md → Authentication](docs/API.md#authentication).
+
+### Testing with a real Claude API key
+
+```bash
+cd backend && ANTHROPIC_API_KEY=... python scripts/claude_smoke.py
+```
+
+This runs every Claude-backed path once: query parsing, extraction from a generated floor-plan PDF plus a Hinglish voice transcript, legal-document reading, and the concierge. It checks the answers against planted facts and costs a few cents. The same script runs in GitHub Actions from **Actions → Claude smoke test → Run workflow** once you add an `ANTHROPIC_API_KEY` repository secret.
 
 ### Offline vs. AI mode
 
@@ -64,7 +82,11 @@ The default model is `claude-opus-5-5`, with server-side refusal fallbacks (`fal
 | `app/concierge/scheduler.py` | Visit slot generation and conflict-checked booking. |
 | `app/core/events.py` | CloudEvents bus, predictive matching (reverse search), notification engine (dedup, quiet hours, opt-in), WhatsApp template payloads. |
 | `app/api/routes.py` | `/ai/upload-listing`, `/ai/search`, `/ai/agent-chat`, `/ai/affordability`, listings, notifications, WhatsApp webhook. |
-| `sql/001_schema.sql`, `sql/002_hybrid_search.sql` | Production Postgres schema plus the hybrid-search and reverse-match functions (validated on PG16 + pgvector). |
+| `sql/001`–`003_*.sql` | Postgres schema, hybrid-search and reverse-match functions, and the app-wiring migration (auth tables, public ids, keyword tokens). |
+| `app/db/` | `Database` contract with in-memory and PostgreSQL (psycopg 3, async pool) implementations, plus the migration runner. |
+| `app/auth/` | Phone OTP login, JWT access tokens, rotating refresh tokens with reuse detection, cookie/bearer resolution, role checks. |
+| `app/ingestion/storage.py` | Content-addressed media storage (local disk; S3 drop-in). |
+| `scripts/claude_smoke.py` | Live end-to-end check of every Claude path against planted facts. |
 
 ### Frontend (Next.js 15 / React 19)
 
@@ -73,4 +95,5 @@ The default model is `claude-opus-5-5`, with server-side refusal fallbacks (`fal
 | `components/ConversationalSearch.tsx` | Chat-style search thread. Parsed filters appear as removable chips (re-query with `filters_override`), alongside soft-preference chips, explainable result cards and relaxation notices. |
 | `components/ListingUploader.tsx` | Drag-and-drop media and legal-doc zones with previews. Voice-note recording (MediaRecorder) with a live Web Speech transcript. Upload progress. Extracted-listing card with clarifying questions. |
 | `components/ConciergeChat.tsx` | Concierge drawer with state and lead-score readout, and slot buttons for booking. |
-| `lib/api.ts` | Typed API client (XHR for upload progress). |
+| `lib/api.ts` | Typed API client. Sends cookies, refreshes the session once on `401` and retries (XHR for upload progress). |
+| `components/AuthProvider.tsx`, `LoginForm.tsx`, `NavAuth.tsx` | Session context, phone-OTP sign-in page (safe `?next=` redirect), nav sign-in/out. Listing requires sign-in. |
